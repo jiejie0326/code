@@ -1,0 +1,383 @@
+clc; clear; close all;
+rng('default');
+rng(40);
+
+% ====================== 参数设置 ======================
+sigma = 0.5;
+rho = 0.55;
+tol = 1e-4;
+maxit = 3000;
+scale_i = 2;
+
+n = 50 * scale_i;
+p = 1460;
+q = 3;
+h = 0.5 * (n^(-1/5));
+
+% ====================== 分组索引 ======================
+s = 73;
+G = p / s;
+group_idx = zeros(p, 1);
+group_list = cell(G, 1);
+for g = 1:G
+    start_idx = (g-1)*s + 1;
+    end_idx = g*s;
+    group_idx(start_idx:end_idx) = g;
+    group_list{g} = start_idx:end_idx;
+end
+
+% ====================== 数据生成 ======================
+beta_0 = zeros(p, 1);
+beta_0(1:4) = [1; 2; 0.5; -1];
+
+% 生成 X
+ss = zeros(p);
+for ii = 1:p
+    for jj = 1:p
+        ss(ii, jj) = 0.5^abs(ii - jj);
+    end
+end
+X = mvnrnd(zeros(1, p), ss, n);
+
+T = rand(n, 1);
+Z = [randn(n, 1), 1.5*randn(n, 1), 2*randn(n, 1)];
+
+funcs = {@(t) sin(8*pi*t), @(t) cos(3*pi*t), @(t) (t-0.2).^2};
+M = zeros(n, 1);
+for ii = 1:n
+    for jj = 1:q
+        M(ii) = M(ii) + Z(ii, jj) * funcs{jj}(T(ii));
+    end
+end
+Y = M + X * beta_0 + normrnd(0, sigma, n, 1);
+
+% ====================== 非参数部分估计 ======================
+I_n = eye(n);
+S_m = zeros(n, n);
+for m = 1:n
+    t_m = T(m);
+    D_m = zeros(n, 2*q);
+    for ii = 1:n
+        D_m(ii, 1:q) = Z(ii, :);
+        D_m(ii, q+1:2*q) = ((T(ii) - t_m)/h) * Z(ii, :);
+    end
+    Kvec = exp(- (T - t_m).^2 / (2 * h^2));
+    DKD = (D_m' .* Kvec') * D_m;
+    reg = 1e-8 * eye(2*q);
+    P = (DKD + reg) \ (D_m' .* Kvec');
+    S_m(m, :) = [Z(m, :), zeros(1, q)] * P;
+end
+X_j = (I_n - S_m) * X;
+Y_j = (I_n - S_m) * Y;
+
+% ====================== 预计算关键矩阵 ======================
+A = X_j' * X_j + rho * speye(p);
+R = chol(A);  % 三角分解，避免在循环中重复计算
+
+% ====================== 在(0,1)范围内的精细Lambda搜索 ======================
+% 使用更多点数和线性+对数混合采样
+num_points = 500;  % 增加搜索点数
+
+% 混合采样策略：在接近0的部分使用对数刻度，在较大值部分使用线性刻度
+log_part = logspace(-4, -1, 200);  % 0.0001到0.1的对数刻度
+linear_part = linspace(0.11, 1, 300);  % 0.11到1的线性刻度
+lambda_grid = unique([log_part, linear_part]);  % 合并并去重
+lambda_grid = sort(lambda_grid);  % 排序
+
+% 确保所有值都在(0,1)范围内
+lambda_grid = lambda_grid(lambda_grid > 0 & lambda_grid < 1);
+
+MSE_list = zeros(length(lambda_grid), 1);
+Beta_store = zeros(p, length(lambda_grid));
+iter_counts = zeros(length(lambda_grid), 1);
+non_zero_counts = zeros(length(lambda_grid), 1);
+
+% ====================== 主循环：使用真实 beta_0 计算 MSE ======================
+fprintf("==== 开始在(0,1)范围内的精细 Lambda 选择 (%d 点) ====\n", length(lambda_grid));
+fprintf("搜索范围: lambda ∈ [%.6f, %.6f]\n", min(lambda_grid), max(lambda_grid));
+
+for l = 1:length(lambda_grid)
+    Lambda = lambda_grid(l);
+    
+    % --- ADMM 初始化 ---
+    beta = zeros(p, 1);
+    alpha = zeros(p, 1);
+    U = zeros(p, 1);
+    
+    for iter = 1:maxit
+        % (1) 更新 beta
+        b = X_j' * Y_j + rho * (alpha - U);
+        beta = R \ (R' \ b);
+        
+        % (2) 更新 alpha
+        for g = 1:G
+            idx = group_list{g};
+            temp = beta(idx) + U(idx);
+            norm_temp = norm(temp, 2);
+            thresh = Lambda / rho;
+            if norm_temp > thresh
+                alpha(idx) = (1 - thresh / norm_temp) * temp;
+            else
+                alpha(idx) = 0;
+            end
+        end
+        
+        % (3) 更新 U
+        U = U + beta - alpha;
+        
+        % (4) 收敛判断
+        err = norm(beta - alpha, 2);
+        if err < tol * max(norm(beta, 2), 1)
+            break;
+        end
+    end
+    
+    % --- 使用真实 beta_0 计算 MSE ---
+    MSE_list(l) = norm(beta - beta_0)^2 / p;
+    Beta_store(:, l) = beta;
+    iter_counts(l) = iter;
+    non_zero_counts(l) = sum(beta ~= 0);
+    
+    % 显示进度
+    if mod(l, 50) == 0 || l <= 10 || l >= length(lambda_grid)-10
+        fprintf('  Lambda=%.6f, MSE=%.6e, 非零系数=%d, iter=%d\n', ...
+                Lambda, MSE_list(l), non_zero_counts(l), iter);
+    end
+end
+
+% ====================== 找到最优 Lambda ======================
+[best_MSE, best_idx] = min(MSE_list);
+best_lambda = lambda_grid(best_idx);
+best_beta = Beta_store(:, best_idx);
+
+fprintf('\n==== 搜索结果总结 ====\n');
+fprintf('最优 Lambda = %.8f\n', best_lambda);
+fprintf('最小 MSE = %.8e\n', best_MSE);
+fprintf('最优 Lambda 处的迭代次数: %d\n', iter_counts(best_idx));
+fprintf('最优 Lambda 处的非零系数数量: %d\n', non_zero_counts(best_idx));
+
+% ====================== 分析结果 ======================
+% 找到MSE在最优值1.01倍、1.05倍、1.1倍以内的Lambda范围
+thresholds = [1.01, 1.05, 1.1];
+for i = 1:length(thresholds)
+    acceptable_MSE = best_MSE * thresholds(i);
+    acceptable_idx = find(MSE_list <= acceptable_MSE);
+    if ~isempty(acceptable_idx)
+        acceptable_lambda_range = [min(lambda_grid(acceptable_idx)), max(lambda_grid(acceptable_idx))];
+        fprintf('可接受的Lambda范围 (MSE <= %.2f×最优): [%.8f, %.8f]\n', ...
+                thresholds(i), acceptable_lambda_range(1), acceptable_lambda_range(2));
+        fprintf('  范围宽度: %.8f\n', acceptable_lambda_range(2) - acceptable_lambda_range(1));
+    end
+end
+
+% 分析不同稀疏度水平的表现
+sparsity_levels = [1, 2, 3, 4, 5, 10, 20];
+fprintf('\n不同稀疏度水平分析:\n');
+for i = 1:length(sparsity_levels)
+    target_sparsity = sparsity_levels(i);
+    [~, idx] = min(abs(non_zero_counts - target_sparsity));
+    fprintf('  稀疏度~%d: Lambda=%.8f, MSE=%.8e\n', ...
+            target_sparsity, lambda_grid(idx), MSE_list(idx));
+end
+
+% ====================== 可视化结果 ======================
+figure('Position', [100, 100, 1400, 1000]);
+
+% 主图：MSE vs Lambda
+subplot(2,3,1);
+semilogx(lambda_grid, MSE_list, '-', 'LineWidth', 2);
+hold on;
+semilogx(best_lambda, best_MSE, 'ro', 'MarkerSize', 10, 'LineWidth', 3);
+xlabel('\lambda (log scale)');
+ylabel('MSE(\beta, \beta_0)');
+title('(0,1)范围内的 \lambda 精细搜索');
+grid on;
+set(gca, 'FontSize', 10);
+legend('MSE曲线', '最优点', 'Location', 'best');
+
+% 非零系数数量 vs Lambda
+subplot(2,3,2);
+semilogx(lambda_grid, non_zero_counts, '-', 'LineWidth', 2, 'Color', [0.8500 0.3250 0.0980]);
+hold on;
+semilogx(best_lambda, non_zero_counts(best_idx), 'ro', 'MarkerSize', 10, 'LineWidth', 3);
+xlabel('\lambda (log scale)');
+ylabel('非零系数数量');
+title('稀疏性 vs \lambda');
+grid on;
+set(gca, 'FontSize', 10);
+
+% 迭代次数 vs Lambda
+subplot(2,3,3);
+semilogx(lambda_grid, iter_counts, '-', 'LineWidth', 2, 'Color', [0.4660 0.6740 0.1880]);
+hold on;
+semilogx(best_lambda, iter_counts(best_idx), 'ro', 'MarkerSize', 10, 'LineWidth', 3);
+xlabel('\lambda (log scale)');
+ylabel('迭代次数');
+title('收敛速度 vs \lambda');
+grid on;
+set(gca, 'FontSize', 10);
+
+% MSE vs 稀疏度
+subplot(2,3,4);
+plot(non_zero_counts, MSE_list, '-', 'LineWidth', 2, 'Color', [0.4940 0.1840 0.5560]);
+hold on;
+plot(non_zero_counts(best_idx), best_MSE, 'ro', 'MarkerSize', 10, 'LineWidth', 3);
+xlabel('非零系数数量');
+ylabel('MSE(\beta, \beta_0)');
+title('MSE vs 稀疏度');
+grid on;
+set(gca, 'FontSize', 10);
+
+% 系数对比图 (前20个)
+subplot(2,3,5);
+plot_idx = 1:min(20, p);
+allx = [plot_idx, plot_idx]';
+ally = [beta_0(plot_idx); best_beta(plot_idx)];
+C = [ones(length(plot_idx),1); 2*ones(length(plot_idx),1)];
+gscatter(allx, ally, C, 'kr', 'os', 8);
+legend('真实 \beta^*', sprintf('估计 \\beta (\\lambda=%.6f)', best_lambda), 'Location', 'best');
+xlabel('第 i 个系数');
+ylabel('\beta 值');
+set(gca, 'FontSize', 10);
+title('系数估计对比 (前20个)');
+
+% 误差分布
+subplot(2,3,6);
+error_distribution = best_beta - beta_0;
+histogram(error_distribution, 50, 'FaceColor', [0.3010 0.7450 0.9330], 'EdgeColor', 'none');
+xlabel('估计误差 (\beta - \beta^*)');
+ylabel('频数');
+title('估计误差分布');
+grid on;
+set(gca, 'FontSize', 10);
+
+% ====================== 在最优区域进行超精细搜索 ======================
+fprintf('\n==== 在最优区域进行超精细搜索 ====\n');
+if best_idx > 1 && best_idx < length(lambda_grid)
+    % 在最优Lambda周围更小的范围内进行超精细搜索
+    search_ratio = 0.1;  % 搜索最优值周围10%的范围
+    left_bound = best_lambda * (1 - search_ratio);
+    right_bound = best_lambda * (1 + search_ratio);
+    
+    % 确保搜索范围在(0,1)内
+    left_bound = max(left_bound, lambda_grid(1));
+    right_bound = min(right_bound, lambda_grid(end));
+    
+    ultra_fine_lambda_grid = linspace(left_bound, right_bound, 200);
+    ultra_fine_MSE_list = zeros(length(ultra_fine_lambda_grid), 1);
+    ultra_fine_non_zero_counts = zeros(length(ultra_fine_lambda_grid), 1);
+    
+    fprintf('超精细搜索范围: [%.8f, %.8f]\n', left_bound, right_bound);
+    
+    for l = 1:length(ultra_fine_lambda_grid)
+        Lambda = ultra_fine_lambda_grid(l);
+        
+        % 使用热启动：从最优解附近开始
+        beta = best_beta;
+        alpha = zeros(p, 1);
+        U = zeros(p, 1);
+        
+        for iter = 1:1000  % 减少迭代次数，因为接近最优解
+            % (1) 更新 beta
+            b = X_j' * Y_j + rho * (alpha - U);
+            beta = R \ (R' \ b);
+            
+            % (2) 更新 alpha
+            for g = 1:G
+                idx = group_list{g};
+                temp = beta(idx) + U(idx);
+                norm_temp = norm(temp, 2);
+                thresh = Lambda / rho;
+                if norm_temp > thresh
+                    alpha(idx) = (1 - thresh / norm_temp) * temp;
+                else
+                    alpha(idx) = 0;
+                end
+            end
+            
+            % (3) 更新 U
+            U = U + beta - alpha;
+            
+            % (4) 收敛判断
+            err = norm(beta - alpha, 2);
+            if err < tol * max(norm(beta, 2), 1)
+                break;
+            end
+        end
+        
+        ultra_fine_MSE_list(l) = norm(beta - beta_0)^2 / p;
+        ultra_fine_non_zero_counts(l) = sum(beta ~= 0);
+    end
+    
+    [ultra_fine_best_MSE, ultra_fine_best_idx] = min(ultra_fine_MSE_list);
+    ultra_fine_best_lambda = ultra_fine_lambda_grid(ultra_fine_best_idx);
+    
+    fprintf('超精细搜索最优 Lambda = %.10f\n', ultra_fine_best_lambda);
+    fprintf('超精细搜索最小 MSE = %.10e\n', ultra_fine_best_MSE);
+    improvement = (best_MSE - ultra_fine_best_MSE) / best_MSE * 100;
+    fprintf('改进: %.6f%%\n', improvement);
+    
+    % 如果找到更好的解，更新结果
+    if ultra_fine_best_MSE < best_MSE && improvement > 0.001  % 只有改进超过0.001%才更新
+        best_lambda = ultra_fine_best_lambda;
+        best_MSE = ultra_fine_best_MSE;
+        fprintf('使用超精细搜索的结果！\n');
+        
+        % 重新计算最优beta
+        Lambda = best_lambda;
+        beta = zeros(p, 1);
+        alpha = zeros(p, 1);
+        U = zeros(p, 1);
+        
+        for iter = 1:maxit
+            b = X_j' * Y_j + rho * (alpha - U);
+            beta = R \ (R' \ b);
+            
+            for g = 1:G
+                idx = group_list{g};
+                temp = beta(idx) + U(idx);
+                norm_temp = norm(temp, 2);
+                thresh = Lambda / rho;
+                if norm_temp > thresh
+                    alpha(idx) = (1 - thresh / norm_temp) * temp;
+                else
+                    alpha(idx) = 0;
+                end
+            end
+            
+            U = U + beta - alpha;
+            err = norm(beta - alpha, 2);
+            if err < tol * max(norm(beta, 2), 1)
+                break;
+            end
+        end
+        best_beta = beta;
+    else
+        fprintf('超精细搜索未发现显著改进，保持原结果。\n');
+    end
+end
+
+% ====================== 最终结果展示 ======================
+fprintf('\n==== 最终结果 ====\n');
+fprintf('最优 Lambda: %.10f\n', best_lambda);
+fprintf('最小 MSE: %.10e\n', best_MSE);
+fprintf('真实非零系数: 4\n');
+fprintf('估计非零系数: %d\n', sum(best_beta ~= 0));
+fprintf('前4个系数的估计值: [%.8f, %.8f, %.8f, %.8f]\n', best_beta(1:4));
+fprintf('前4个系数的真实值: [%.8f, %.8f, %.8f, %.8f]\n', beta_0(1:4));
+
+% 计算模型选择指标
+true_positives = best_beta(1:4) ~= 0;
+false_positives = best_beta(5:end) ~= 0;
+true_positive_count = sum(true_positives);
+false_positive_count = sum(false_positives);
+
+fprintf('真阳性 (前4个): %d/4\n', true_positive_count);
+fprintf('假阳性 (其他): %d\n', false_positive_count);
+
+% 计算系数估计的相对误差
+relative_errors = abs(best_beta(1:4) - beta_0(1:4)) ./ abs(beta_0(1:4));
+fprintf('前4个系数的相对误差: [%.4f%%, %.4f%%, %.4f%%, %.4f%%]\n', ...
+        relative_errors(1)*100, relative_errors(2)*100, relative_errors(3)*100, relative_errors(4)*100);
+
+fprintf('\n==== 搜索完成 ====\n');

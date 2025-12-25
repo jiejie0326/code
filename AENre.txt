@@ -1,0 +1,221 @@
+clc; clear;
+rng('default');   % 重置随机数生成器为其默认配置
+rng(40);          % 再次设置随机数生成器的种子为40
+
+% 初始化参数
+sigma = 0.5;        % 噪声的标准差
+rho = 0.55;       % 相关系数，这里设置为1，表示完全相关/罚参
+maxit = 5000;     % 最大迭代次数
+Lambda1 = 0.06;   % L1正则化参数
+Lambda2 = 0.1;    % L2正则化参数
+tol = 1e-4;       % 收敛容忍度
+i = 2;
+
+% 生成数据的规模
+n = 50 * i;       % 样本数量
+p =3260;         % 特征数量
+q = 3;
+s = 14 * i;       % 用于生成分组索引的参数
+h = 0.5 * (n^(-1/5)); % 高斯核的带宽
+
+% 生成分组索引
+g1 = (0:79)' * s + 1;    % 第一个分组的索引
+g2 = (1:80)' * s;        % 第二个分组的索引
+gindex = [g1, g2];       % 合并两个分组的索引
+
+beta_0 = zeros(p, 1); % 真值/初始化系数向量
+% 为前几个元素分配值
+beta_0(1) = 1;
+beta_0(2) = 2;
+beta_0(3) = 0.5;
+beta_0(4) = -1;
+
+% 生成设计矩阵X
+ss = zeros(p); % 初始化一个p*p的零矩阵
+for i = 1:p
+    for j = 1:p
+        ss(i,j) = 0.5^abs(i-j); % 计算协方差
+    end
+end
+X = mvnrnd(zeros(p,1), ss, n);
+T = rand(n,1);
+
+% 初始化矩阵Z
+Z = zeros(n, q);
+
+% 为每一列生成数据
+Z(:, 1) = random('norm', 0, 1, n, 1); % Z1 ~ N(0,1)
+Z(:, 2) = random('norm', 0, 1.5, n, 1); % Z2 ~ N(0,1.5)
+Z(:, 3) = random('norm', 0, 2, n, 1); % Z3 ~ N(0,2)
+
+funcs = {
+    @(T) sin(8*pi*T),
+    @(T) cos(3*pi*T),
+    @(T) (T-0.2).^2,
+};
+
+% 初始化一个n*1的矩阵M
+M = zeros(n, 1);
+
+% 外层循环遍历行
+for i = 1:n
+    % 内层循环遍历列
+    for j = 1:q
+        % 取出第i行第j个元素
+        z_ij = Z(i, j);
+        
+        % 将取出的元素与第j个函数相乘
+        M(i) = z_ij * funcs{j}(T(i));
+    end
+end
+Y = M + X * beta_0 + normrnd(0, sigma, [n,1]);
+
+t = T;
+
+gaussianKernel = @(t, T) exp(-(t - T).^2 / (2 * h^2));
+K = zeros(n*n, n);
+% 计算高斯核函数值并填充对角线
+for j = 1:n
+    for i = 1:n
+        % 高斯核函数   (~)
+         K((j-1)*n+i, i) = gaussianKernel(t(j), T(i)); 
+    end
+end
+d = zeros(n*n, 2*q);
+for i = 1:n   
+    for m = 1:n
+        d((i-1)*n+m,:) = [Z(m,:), (T(m)-t(i))/h*Z(m,:)];
+    end
+end
+
+% 初始化S_{(m)}
+S_m = zeros(n, n);
+
+% 构建S_{(m)}
+for m = 1:n
+   S_m(m, :) =  [Z(m,:), zeros(1,q)] * inv(d((m-1)*n+1:m*n, :)' * K((m-1)*n+1:m*n, :) * d((m-1)*n+1:m*n, :)) * d((m-1)*n+1:m*n, :)' * K((m-1)*n+1:m*n,:);
+end
+I_m = eye(n);
+X_j = (I_m - S_m) * X;
+Y_j = (I_m - S_m) * Y;
+beta_LS = (X_j' * X_j) \ (X_j' * Y_j);
+
+w = zeros(p, 1); % 初始化w向量
+for j = 1:p
+    if beta_0(j) ~= 0 % 避免除以零
+       w(j) = 1 / (abs(beta_0(j))); % 计算omega_j
+    else
+       w(j) = Inf; % 如果beta_LS(j)为零，则设置omega_j为无穷大
+    end
+end
+
+I = eye(p); % I是pxp的单位矩阵
+beta = zeros(p,1);
+y = zeros(p,1);
+lambda = zeros(p,1);
+alpha = zeros(p, 1); % 初始化 alpha
+u = zeros(p, 1);      % 初始化 u
+
+% 初始化相对误差数组
+relative_errors_1 = zeros(maxit, 1);
+
+tic;
+for iter = 1:maxit
+    beta0 = beta;
+    if mod(iter,5) ~= 0
+        Nu = 11^iter;
+    elseif iter <= 40
+        Nu = max(11^iter * 0.75, 0.1);
+    else
+        Nu = min(11^iter * 1.5, 50);
+    end
+    
+    % beta-update   
+    A = I * rho + X_j' * X_j;  % 确保 A 是方阵
+    eigenvalues = eig(A);
+    max_eigenvalue = max(abs(eigenvalues)); 
+    B = rho * I * (alpha - u) + X_j' * Y_j;  % 确保 B 是列向量
+    beta = inv(A) * B;
+  
+    % y-update
+    alpha = (rho / (rho + 2 * Lambda2)) * softthresholding(beta + u, Lambda1 * w / rho);
+  
+    % lambda-update
+    u = u + beta - alpha;
+  
+    % 计算相对误差
+    relative_errors_1(iter) = norm(beta - beta_0) / norm(beta_0);
+  
+    % err 
+    err = norm(beta - beta0);
+  r1=norm(beta - beta_0) / norm(beta_0);
+    y0(iter) = err;
+    if (err < tol * max(norm(beta), 1))
+        break;
+    end
+end
+
+err
+r1
+
+Lambda_1 =0.55;    % L1正则化参数
+Lambda_2 =0.1;    % L2正则化参数
+
+beta_=zeros(p,1);
+y_=zeros(p,1);
+lambda_=zeros(p,1);
+alpha_ = zeros(p, 1); % 初始化 alpha
+u_ = zeros(p, 1);      % 初始化 u
+
+% 初始化相对误差数组
+relative_errors_2 = zeros(maxit, 1);
+
+tic;
+for iter  = 1:maxit
+    beta0=beta_;
+    if mod(iter,5)~=0
+        Nu=11^iter;
+    else if iter<=40
+            Nu=max(11^iter*0.75,0.1);
+        else
+            Nu=min(11^iter*1.5,50);
+        end
+    end
+
+% beta-update   
+  A_ = I*rho + X_j'*X_j;  % 确保 A 是方阵
+%  eigenvalues = eig(A);
+% max_eigenvalue = max(abs(eigenvalues)); 
+  B_= rho*I*(alpha_-u_)+ X_j'*Y_j;  % 确保 B 是列向量
+        beta_ = inv(A_) * B_;
+  %  y-update
+   alpha_ = (rho / (rho + 2 * Lambda_2)) * softthresholding(beta_ + u_, Lambda_1 / rho);
+%  lambda-update
+    u_=u_+beta_-alpha_ ;
+% 计算相对误差
+    relative_errors_2(iter) = norm(beta_ - beta_0) / norm(beta_0);
+   r2=norm(beta_ - beta_0) / norm(beta_0);
+    % err 
+    err_ = norm(beta_ - beta0);
+    y0_(iter) = err_;
+    if (err_ < tol * max(norm(beta_), 1))
+        break;
+    end
+end
+
+err_
+r2
+figure;
+plot(1:iter, relative_errors_1(1:iter), 'r', 'LineWidth', 2); % 红色表示第一个代码的结果
+hold on;
+plot(1:iter, relative_errors_2(1:iter), 'b', 'LineWidth', 2); % 蓝色表示第二个代码的结果
+xlabel('Iter');
+ylabel('RE');
+legend('AEN', 'EN '); % 添加图例
+grid on;
+hold off;
+
+% 近端运算符函数
+function soft_thresh = softthresholding(b, lambda)
+    soft_thresh = sign(b) .* max(abs(b) - lambda, 0);
+end

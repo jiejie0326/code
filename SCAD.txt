@@ -1,0 +1,193 @@
+clc; clear; close all;
+rng('default');
+rng(40); % 固定随机种子
+
+% ====================== 初始化参数 ======================
+sigma = 2;      % 噪声标准差
+rho = 0.55;       % ADMM罚参数
+Lambda = 0.005;     % SCAD正则化参数 (与Group Lasso相同)
+tol = 1e-4;       % 收敛容忍度
+maxit = 5000;     % 最大迭代次数
+i = 2;
+
+% ====================== 数据生成 ======================
+n = 50 * i;       % 样本量 = 100
+p = 3260;          % 特征数
+q = 3;            % 协变量维度
+h = 0.5 * (n^(-1/5)); % 高斯核带宽
+
+% 生成真实参数beta_0（前4个特征非零，其余为0）
+beta_0 = zeros(p, 1);
+beta_0(1) = 1;   % 特征1系数=1
+beta_0(2) = 2;   % 特征2系数=2
+beta_0(3) = 0.5; % 特征3系数=0.5
+beta_0(4) = -1;  % 特征4系数=-1
+% 其余特征=0（稀疏性）
+
+% 生成特征矩阵X（指数相关）
+ss = zeros(p);
+for i = 1:p
+    for j = 1:p
+        ss(i, j) = 0.5^abs(i - j);
+    end
+end
+X = mvnrnd(zeros(p, 1), ss, n);
+
+% 生成时间变量T和协变量Z
+T = rand(n, 1);
+Z = [randn(n, 1), 1.5*randn(n, 1), 2*randn(n, 1)];
+
+% 定义非参数函数
+funcs = {
+    @(T) sin(8*pi*T),
+    @(T) cos(3*pi*T),
+    @(T) (T-0.2).^2
+};
+
+% 计算非参数项M
+M = zeros(n, 1);
+for i = 1:n
+    for j = 1:q
+        M(i) = M(i) + Z(i, j) * funcs{j}(T(i));
+    end
+end
+
+% 生成响应变量Y
+Y = M + X * beta_0 + normrnd(0, sigma, n, 1);
+
+% ====================== 非参数部分估计 ======================
+t = T;
+gaussianKernel = @(t, T) exp(-(t - T).^2 / (2 * h^2));
+K = zeros(n*n, n);
+for j = 1:n
+    for i = 1:n
+        K((j-1)*n+i, i) = gaussianKernel(t(j), T(i));
+    end
+end
+
+d = zeros(n*n, 2*q);
+for i = 1:n
+    for m = 1:n
+        d((i-1)*n+m, :) = [Z(m, :), (T(m)-t(i))/h * Z(m, :)];
+    end
+end
+
+S_m = zeros(n, n);
+for m = 1:n
+    D_m = d((m-1)*n+1:m*n, :);
+    K_m = K((m-1)*n+1:m*n, :);
+    S_m(m, :) = [Z(m, :), zeros(1, q)] * inv(D_m' * K_m * D_m) * D_m' * K_m;
+end
+
+I_m = eye(n);
+X_j = (I_m - S_m) * X; % 去除非参数影响的特征 (100×3260)
+Y_j = (I_m - S_m) * Y; % 去除非参数影响的响应 (100×1)
+
+% ====================== SCAD 惩罚的 ADMM (核心修改) ======================
+% 初始化
+beta = zeros(p, 1);    % 参数估计 (3260×1)
+alpha = beta;          % 辅助变量 (3260×1)
+U = zeros(p, 1);       % 乘子 (3260×1)
+
+% 添加 SCAD 参数 (a=3.7 是标准值)
+a = 3.7;  % SCAD 平滑参数
+
+tic;
+for iter = 1:maxit
+    % 1. 更新 beta (闭式解，保持不变)
+    A = X_j' * X_j + rho * eye(p);
+    B = X_j' * Y_j + rho * (alpha - U);
+    beta = A \ B;
+    
+    % 2. 更新 alpha (SCAD 近端算子 - 单变量更新 ✅)
+    for j = 1:p
+        temp = beta(j) + U(j);  % 临时值
+        if abs(temp) <= Lambda
+            alpha(j) = 0;
+        elseif abs(temp) <= a * Lambda
+            alpha(j) = sign(temp) * (a * abs(temp) - Lambda) / (a - 1);
+        else
+            alpha(j) = temp;
+        end
+    end
+    
+    % 3. 更新乘子 U (保持不变)
+    U = U + beta - alpha;
+    
+    % 4. 收敛检查 (保持不变)
+    err = norm(beta - alpha, 2);
+    if err < tol * max(norm(beta), 1)
+        fprintf('Converged at iteration %d (err = %.2e)\n', iter, err);
+        break;
+    end
+end
+time = toc;
+
+% ====================== 结果评估 ======================
+MSE = norm(beta - beta_0)^2 / p;
+
+fprintf('运行时间: %.4f 秒, MSE: %.3e, err: %.3e, 迭代次数: %d\n', time, MSE, err, iter);
+
+%% results visualization
+pt = p;
+figure(1); 
+C = [ones(pt, 1); 2*ones(pt, 1)];        
+h2 = gscatter([1:pt, 1:pt]', [beta_0; beta], C, 'ky', 'os', [10, 10]);
+h1 = legend('True solution beta^*', 'Estimated Solution beta');
+set(h1, 'FontSize', 13);
+set(h2, 'LineWidth', 2);
+axis on;
+set(gca, 'XTick', [1, 500, 1000, 1500, 2000, 2560])
+set(gca, 'FontSize', 13);
+xlabel('i-th component');
+ylabel('beta');
+
+% ====================== 新增：计算目标函数值与相对误差 ======================
+
+% 计算真实beta_0对应的目标函数值
+Lambda = 0.005;  % 与代码中一致
+a = 3.7;         % SCAD平滑参数
+
+% 1. 真实目标函数值
+linear_part_true = 0.5 * norm(Y_j - X_j * beta_0)^2;
+scad_penalty_true = 0;
+for j = 1:length(beta_0)
+    t = abs(beta_0(j));
+    if t <= Lambda
+        scad_penalty_true = scad_penalty_true + Lambda * t;
+    elseif t <= a * Lambda
+        scad_penalty_true = scad_penalty_true + (a * Lambda * t - t^2 / 2) / (a - 1);
+    else
+        scad_penalty_true = scad_penalty_true + (a^2 - 1) * Lambda^2 / (2 * (a - 1));
+    end
+end
+true_objective_value = linear_part_true + scad_penalty_true;
+
+% 2. 估计beta对应的目标函数值
+linear_part_est = 0.5 * norm(Y_j - X_j * beta)^2;
+scad_penalty_est = 0;
+for j = 1:length(beta)
+    t = abs(beta(j));
+    if t <= Lambda
+        scad_penalty_est = scad_penalty_est + Lambda * t;
+    elseif t <= a * Lambda
+        scad_penalty_est = scad_penalty_est + (a * Lambda * t - t^2 / 2) / (a - 1);
+    else
+        scad_penalty_est = scad_penalty_est + (a^2 - 1) * Lambda^2 / (2 * (a - 1));
+    end
+end
+est_objective_value = linear_part_est + scad_penalty_est;
+
+% 3. 计算相对误差
+% 目标函数相对误差
+obj_rel_error = abs(est_objective_value - true_objective_value) / abs(true_objective_value);
+
+% beta相对误差
+beta_rel_error = norm(beta - beta_0) / norm(beta_0);
+
+% 输出结果
+%fprintf('\n=== 误差分析 ===\n');
+%fprintf('真实目标函数值: %.4e\n', true_objective_value);
+%fprintf('估计目标函数值: %.4e\n', est_objective_value);
+fprintf('目标函数相对误差: %.4e\n', obj_rel_error);
+fprintf('beta相对误差: %.4e\n', beta_rel_error);

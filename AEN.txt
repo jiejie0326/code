@@ -1,0 +1,181 @@
+clc;clear;
+rng('default');   % 重置随机数生成器为其默认配置
+rng('default')
+rng(40);          % 再次设置随机数生成器的种子为40，这一步可能是多余的，因为rng(35)已经设置了种子
+% 初始化参数
+sigma = 0.5;     % 噪声的标准差
+rho = 0.55; % 相关系数，这里设置为1，表示完全相关/罚参
+% tao=(1+sqrt(5))/2
+maxit = 5000;     % 最大迭代次数
+Lambda1 =0.06;    % L1正则化参数
+Lambda2 =0.1;    % L2正则化参数
+tol = 1e-4;       % 收敛容忍度
+i=2;
+% 生成数据的规模
+n = 50 * i;      % 样本数量
+p =560; % 特征数量
+q=3;
+s = 14 * i;       % 用于生成分组索引的参数
+ h = 0.5 * (n^(-1/5)); % 高斯核的带宽
+% 生成分组索引
+g1 = (0:79)' * s + 1;    % 第一个分组的索引
+g2 = (1:80)' * s;        % 第二个分组的索引
+gindex = [g1, g2];       % 合并两个分组的索引
+
+beta_0 = zeros(p, 1); % 真值/初始化系数向量
+% 为前几个元素分配值
+beta_0(1) = 1;
+beta_0(2) = 2;
+beta_0(3) = 0.5;
+beta_0(4) = -1;
+
+% 生成设计矩阵X
+%  X = random('norm', 0, 1, n, p);
+% % X = normrnd(0, 1, n, p)
+% for k=1:p
+%     X(:, k) = X(:, k) / norm(X(:, k));
+% end
+% 生成设计矩阵Z
+%  Z = random('norm', 0, 1, n, q);
+% % Z = normrnd(0, 1, n, q)
+% for k=1:q
+%     Z(:, k) = Z(:, k) / norm(Z(:, k));
+% end
+ss=zeros(p); % 初始化一个p*p的零矩阵
+for i = 1:p
+    for j = 1:p
+        ss(i,j) = 0.5^abs(i-j); % 计算协方差
+    end
+end
+X = mvnrnd(zeros(p,1), ss, n);
+T=rand(n,1);
+% for i = 1:n
+%     % 取出第i个元素
+%     T_i = T(i);
+% end
+% 初始化矩阵Z
+Z = zeros(n, q);
+
+% 为每一列生成数据
+Z(:, 1) = random('norm', 0, 1, n, 1); % Z1 ~ N(0,1)
+Z(:, 2) = random('norm', 0, 1.5, n, 1); % Z2 ~ N(0,1.5)
+Z(:, 3) = random('norm', 0, 2, n, 1); % Z3 ~ N(0,2)
+funcs = {
+    @(T) sin(8*pi*T),
+    @(T) cos(3*pi*T),
+    @(T) (T-0.2).^2,
+};
+% 初始化一个n*1的矩阵M
+M = zeros(n, 1);
+  
+% 外层循环遍历行
+for i = 1:n
+    % 内层循环遍历列
+    for j = 1:q
+        % 取出第i行第j个元素
+        z_ij = Z(i, j);
+        
+        % 将取出的元素与第j个函数相乘
+        M(i) = z_ij * funcs{j}(T(i));
+    end
+end
+Y=M+X*beta_0+normrnd(0,sigma,[n,1]);
+
+t = T;
+
+gaussianKernel = @(t, T) exp(-(t - T).^2 / (2 * h^2));
+K = zeros(n*n, n);
+% 计算高斯核函数值并填充对角线
+for j = 1:n
+    for i=1:n
+        % 高斯核函数   (~)
+         K((j-1)*n+i, i) = gaussianKernel(t(j), T(i)); 
+    end
+end
+d=zeros(n*n,2*q);
+for i=1:n   
+for m = 1:n
+ d((i-1)*n+m,:)=[Z(m,:),(T(m)-t(i))/h*Z(m,:)];
+end
+end
+% 初始化S_{(m)}
+S_m = zeros(n, n);
+%J=zeros(n,2*q);
+% 构建S_{(m)}
+for m = 1:n
+   S_m(m, :) =  [Z(m,:),zeros(1,q)]*inv(d((m-1)*n+1:m*n, :)'*K((m-1)*n+1:m*n, :)*d((m-1)*n+1:m*n, :))*d((m-1)*n+1:m*n, :)'*K((m-1)*n+1:m*n,:);
+end
+I_m =  eye(n);
+X_j=(I_m-S_m)*X;
+Y_j=(I_m-S_m)*Y;
+beta_LS = (X_j' * X_j) \ (X_j' * Y_j);
+
+w = zeros(p, 1); % 初始化w向量
+for j = 1:p
+    if beta_0(j) ~= 0 % 避免除以零
+       w(j) = 1 / (abs(beta_0(j))); % 计算omega_j
+    else
+       w(j) = Inf; % 如果beta_LS(j)为零，则设置omega_j为无穷大
+    end
+end
+ I = eye(p); % I是pxp的单位矩阵
+beta=zeros(p,1);
+y=zeros(p,1);
+lambda=zeros(p,1);
+alpha = zeros(p, 1); % 初始化 alpha
+u = zeros(p, 1);      % 初始化 u
+ tic;
+for iter  = 1:maxit
+    beta0=beta;
+    if mod(iter,5)~=0
+        Nu=11^iter;
+    else if iter<=40
+            Nu=max(11^iter*0.75,0.1);
+        else
+            Nu=min(11^iter*1.5,50);
+        end
+    end
+    
+% beta-update   
+  A = I*rho + X_j'*X_j;  % 确保 A 是方阵
+ eigenvalues = eig(A);
+max_eigenvalue = max(abs(eigenvalues)); 
+  B = rho*I*(alpha-u)+ X_j'*Y_j;  % 确保 B 是列向量
+        beta = inv(A) * B;
+  %  y-update
+   alpha = (rho / (rho + 2 * Lambda2)) * softthresholding(beta + u, Lambda1*w / rho);
+%  lambda-update
+    u=u+beta-alpha ;
+%    err 
+    err=norm(beta-beta0)
+  y0(iter) = err;
+    if (err < tol * max(norm(beta), 1))
+        break;
+    end
+end
+ time=toc
+err
+MSE=norm(beta-beta_0)^2/p
+% g_pre = W * (Y - X * beta);
+% y_pre = X * beta + g_pre;
+% erry = norm(y_pre - Y) / sqrt(n);
+fprintf('运行时间: %f 秒, MSE: %f, err:%f,迭代次数: %d\n', time, MSE,err, iter);
+
+%% results visualization
+pt = p;
+figure(1); 
+C = [ones(pt, 1); 2*ones(pt, 1)];        
+h2 = gscatter([1:pt, 1:pt]', [beta_0; beta], C, 'kr', 'os', [10, 10]);
+h1 = legend('True solution beta^*', 'Estimated Solution beta');
+set(h1, 'FontSize', 13);
+set(h2, 'LineWidth', 2);
+axis on;
+set(gca, 'XTick', [1, 500, 1000, 1500, 2000, 2560])
+set(gca, 'FontSize', 13);
+xlabel('i-th component');
+ylabel('beta');
+
+% 近端运算符函数
+function soft_thresh = softthresholding(b, lambda)
+    soft_thresh = sign(b) .* max(abs(b) - lambda, 0);
+end

@@ -1,0 +1,194 @@
+clc; clear;
+rng('default');
+rng(40);
+
+%% 参数设置
+sigma = 0.5;       % 噪声标准差
+maxit = 1000;      % 最大迭代次数
+tol = 1e-4;        % 收敛阈值
+rho = 1;           % ADMM惩罚参数
+tao = 0.9;         % 松弛参数
+q = 3;             % 协变量维度
+m = 20;            % B样条基数量
+r = 3;             % B样条阶数
+
+n = 100;           % 样本量
+p = 560;           % 变量维度
+beta_true = zeros(p,1);  
+beta_true(1:4) = [2.5; 1.2; 0.5; 1.8]; 
+
+K = 5;             % 交叉验证折数
+lambda1_grid = logspace(-3, -1, 10); 
+lambda2_grid = logspace(-3, -1, 10);
+
+%% 数据生成 
+ss = toeplitz(0.5.^(0:p-1));
+X = mvnrnd(zeros(p,1), ss, n);
+
+T = sort(rand(n,1)); 
+Z = [randn(n,1), 1.5*randn(n,1), 2*randn(n,1)];
+
+funcs = {
+    @(t)5.5+0.1*exp(2*t-1);
+    @(t)2-sin(pi*t);
+    @(t)0.5+t.*(1-t)
+};
+
+M = zeros(n,1);
+for i=1:n
+    for j=1:q
+        M(i) = M(i) + Z(i,j)*funcs{j}(T(i));
+    end
+end
+Y = M + X*beta_true + normrnd(0,sigma,n,1);
+
+%% 交叉验证主程序
+cv = cvpartition(n, 'KFold', K);
+cvErrors = zeros(length(lambda1_grid), length(lambda2_grid));
+
+for l1_idx = 1:length(lambda1_grid)
+    Lambda1 = lambda1_grid(l1_idx);
+    for l2_idx = 1:length(lambda2_grid)
+        Lambda2 = lambda2_grid(l2_idx);
+        
+        fprintf('CV进度: Lambda1=%.3f(%d/%d), Lambda2=%.3f(%d/%d)\n',...
+               Lambda1, l1_idx, length(lambda1_grid),...
+               Lambda2, l2_idx, length(lambda2_grid));
+        
+        foldErrors = zeros(K, 1);
+        
+        parfor k = 1:K
+            % 数据划分
+            trainIdx = training(cv, k);
+            testIdx = test(cv, k);
+            
+            X_train = X(trainIdx, :);
+            Y_train = Y(trainIdx);
+            T_train = T(trainIdx);
+            Z_train = Z(trainIdx, :);
+            
+            X_test = X(testIdx, :);
+            Y_test = Y(testIdx);
+            T_test = T(testIdx);
+            Z_test = Z(testIdx, :);
+            
+            % 训练集B样条基 (优化计算)
+            min_T = min(T_train);
+            max_T = max(T_train);
+            inner_knots = linspace(min_T, max_T, m - r + 1);
+            knots = [repmat(min_T,1,r), inner_knots, repmat(max_T,1,r)];
+            
+            % 向量化B样条生成
+            B_train = zeros(length(T_train), m);
+            for i = 1:length(T_train)
+                t = T_train(i);
+                B_train(i,:) = arrayfun(@(j) bSplineBasis(j, r, knots, t), 1:m);
+            end
+            H_train = zeros(length(T_train), q*m);
+            for j = 1:q
+                H_train(:, (j-1)*m+1:j*m) = Z_train(:,j) .* B_train;
+            end
+            
+            % 测试集B样条基
+            B_test = zeros(length(T_test), m);
+            for i = 1:length(T_test)
+                t = T_test(i);
+                B_test(i,:) = arrayfun(@(j) bSplineBasis(j, r, knots, t), 1:m);
+            end
+            H_test = zeros(length(T_test), q*m);
+            for j = 1:q
+                H_test(:, (j-1)*m+1:j*m) = Z_test(:,j) .* B_test;
+            end
+            
+            % ADMM求解 (保持原始迭代格式)
+            [beta_est, gamma_est] = admm_solver(X_train, Y_train, H_train, Lambda1, Lambda2, rho, maxit, tol, tao, beta_true);
+            
+            % 预测误差 (添加维度校验)
+            assert(size(X_test,2)==length(beta_est), 'X_test与beta维度不匹配');
+            assert(size(H_test,2)==length(gamma_est), 'H_test与gamma维度不匹配');
+            foldErrors(k) = norm(beta_est - beta_true).^2;
+        end
+        
+        cvErrors(l1_idx, l2_idx) = mean(foldErrors);
+    end
+end
+
+% 最优参数
+[minCVError, minIdx] = min(cvErrors(:));
+[best_l1_idx, best_l2_idx] = ind2sub(size(cvErrors), minIdx);
+bestLambda1 = lambda1_grid(best_l1_idx);
+bestLambda2 = lambda2_grid(best_l2_idx);
+
+fprintf('最优参数: Lambda1=%.4f, Lambda2=%.4f\n最小交叉验证误差: %.4f\n', bestLambda1, bestLambda2, minCVError);
+
+%% ADMM求解器函数 (保持迭代格式不变)
+function [beta, gamma] = admm_solver(X, Y, H, Lambda1, Lambda2, rho, maxit, tol, tao, beta_true)
+    [n_train, p] = size(X);
+    qm = size(H, 2);
+    
+    beta = zeros(p, 1);
+    gamma = zeros(qm, 1);
+    z = zeros(p, 1);
+    lambda = zeros(p, 1);
+    
+    I = eye(p);
+    HTH = H' * H;
+    
+    % 自适应权重 (保持原逻辑)
+    w = 1 ./ (abs(beta_true) + 1e-5);  % 避免除零
+    w(isinf(w)) = max(w(~isinf(w)));
+    
+    for iter = 1:maxit
+        beta_prev = beta;
+        
+        % beta更新 (严格保持原公式)
+        A = X'*X + (2*Lambda2 + rho) * I + 0.5*I;  % 保留0.5*I项
+        b = X'*(Y - H*gamma) + rho*z - lambda + 0.5*I*beta;  % 保留0.5*I*beta项
+        beta = A \ b;
+        
+        % gamma更新 (增强数值稳定性)
+        gamma = (HTH + 1e-6*eye(qm)) \ (H'*(Y - X*beta));  % 调整正则化系数
+        
+        % z更新 (保持原软阈值)
+        z_hat = beta + lambda / rho;
+        z = sign(z_hat) .* max(abs(z_hat) - Lambda1*w/rho, 0);
+        
+        % 对偶变量更新 (保持原松弛格式)
+        lambda = lambda + tao * rho * (beta - z);
+        
+        % 收敛判断
+        if norm(beta - beta_prev) < tol * max(norm(beta), 1)
+            break;
+        end
+    end
+end
+
+%% B样条基函数 (保持递归实现)
+function N = bSplineBasis(i0, r, knots, z)
+    if z < knots(1) || z > knots(end)
+        N = 0;
+        return;
+    end
+    
+    if r == 0
+        N = (z >= knots(i0)) & (z < knots(i0+1));
+        if z == knots(end)
+            N = (i0 == length(knots)-1);
+        end
+    else
+        denom_left = knots(i0+r) - knots(i0);
+        alpha = 0;
+        if denom_left ~= 0
+            alpha = (z - knots(i0)) / denom_left;
+        end
+        
+        denom_right = knots(i0+r+1) - knots(i0+1);
+        beta = 0;
+        if denom_right ~= 0
+            beta = (knots(i0+r+1) - z) / denom_right;
+        end
+        
+        N = alpha * bSplineBasis(i0, r-1, knots, z) + ...
+            beta * bSplineBasis(i0+1, r-1, knots, z);
+    end
+end

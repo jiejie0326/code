@@ -1,0 +1,323 @@
+clc; clear; close all;
+rng('default');
+rng(40); % 固定随机种子
+
+% ====================== 初始化参数 ======================
+sigma = 0.5;      % 噪声标准差
+rho = 0.55;       % ADMM罚参数
+tol = 1e-4;       % 收敛容忍度
+maxit = 5000;     % 最大迭代次数
+i = 2;
+
+% ====================== 数据生成 ======================
+n = 50 * i;       % 样本量 = 100
+p = 560;          % 特征数
+q = 3;            % 协变量维度
+h = 0.5 * (n^(-1/5)); % 高斯核带宽
+
+% 生成真实参数beta_0（前4个特征非零，其余为0）
+beta_0 = zeros(p, 1);
+beta_0(1) = 1;   % 特征1系数=1
+beta_0(2) = 2;   % 特征2系数=2
+beta_0(3) = 0.5; % 特征3系数=0.5
+beta_0(4) = -1;  % 特征4系数=-1
+% 其余特征=0（稀疏性）
+
+% 生成特征矩阵X（指数相关）
+ss = zeros(p);
+for idx = 1:p
+    for jdx = 1:p
+        ss(idx, jdx) = 0.5^abs(idx - jdx);
+    end
+end
+X = mvnrnd(zeros(p, 1), ss, n);
+
+% 生成时间变量T和协变量Z
+T = rand(n, 1);
+Z = [randn(n, 1), 1.5*randn(n, 1), 2*randn(n, 1)];
+
+% 定义非参数函数
+funcs = {
+    @(T) sin(8*pi*T),
+    @(T) cos(3*pi*T),
+    @(T) (T-0.2).^2
+};
+
+% 计算非参数项M
+M = zeros(n, 1);
+for idx = 1:n
+    for jdx = 1:q
+        M(idx) = M(idx) + Z(idx, jdx) * funcs{jdx}(T(idx));
+    end
+end
+
+% 生成响应变量Y
+Y = M + X * beta_0 + normrnd(0, sigma, n, 1);
+
+% ====================== 非参数部分估计 ======================
+t = T;
+gaussianKernel = @(t, T) exp(-(t - T).^2 / (2 * h^2));
+K = zeros(n*n, n);
+for jdx = 1:n
+    for idx = 1:n
+        K((jdx-1)*n+idx, idx) = gaussianKernel(t(jdx), T(idx));
+    end
+end
+
+d = zeros(n*n, 2*q);
+for idx = 1:n
+    for m = 1:n
+        d((idx-1)*n+m, :) = [Z(m, :), (T(m)-t(idx))/h * Z(m, :)];
+    end
+end
+
+S_m = zeros(n, n);
+for m = 1:n
+    D_m = d((m-1)*n+1:m*n, :);
+    K_m = K((m-1)*n+1:m*n, :);
+    S_m(m, :) = [Z(m, :), zeros(1, q)] * inv(D_m' * K_m * D_m) * D_m' * K_m;
+end
+
+I_m = eye(n);
+X_j = (I_m - S_m) * X; % 去除非参数影响的特征
+Y_j = (I_m - S_m) * Y; % 去除非参数影响的响应
+
+% ====================== 精细化交叉验证寻找最佳Lambda ======================
+% 定义Lambda候选值范围（更精细的网格搜索）
+lambda_values = [0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.2, 0.22, 0.24, 0.26, 0.28, 0.3, 0.35, 0.4, 0.45, 0.5];
+num_lambdas = length(lambda_values);
+num_folds = 5; % 5折交叉验证
+
+% 交叉验证结果存储
+cv_mse = zeros(num_lambdas, 1);
+cv_std = zeros(num_lambdas, 1); % 存储标准差
+
+% 5折交叉验证
+cv_indices = crossvalind('Kfold', n, num_folds);
+
+fprintf('开始交叉验证...\n');
+fprintf('Lambda候选值数量: %d\n', num_lambdas);
+fprintf('交叉验证折数: %d\n', num_folds);
+
+for lambda_idx = 1:num_lambdas
+    Lambda = lambda_values(lambda_idx);
+    fold_mse = zeros(num_folds, 1);
+    
+    for fold = 1:num_folds
+        % 分割数据为训练集和验证集
+        test_idx = (cv_indices == fold);
+        train_idx = ~test_idx;
+        
+        % 获取训练集和验证集
+        X_train = X_j(train_idx, :);
+        Y_train = Y_j(train_idx);
+        X_val = X_j(test_idx, :);
+        Y_val = Y_j(test_idx);
+        
+        % SCAD惩罚的ADMM算法（仅在训练集上）
+        a = 3.7;  % SCAD平滑参数
+        beta = zeros(p, 1);
+        alpha = beta;
+        U = zeros(p, 1);
+        
+        for iter = 1:maxit
+            % 1. 更新 beta
+            A = X_train' * X_train + rho * eye(p);
+            B = X_train' * Y_train + rho * (alpha - U);
+            beta = A \ B;
+            
+            % 2. 更新 alpha (SCAD近端算子)
+            for jdx = 1:p
+                temp = beta(jdx) + U(jdx);
+                if abs(temp) <= Lambda
+                    alpha(jdx) = 0;
+                elseif abs(temp) <= a * Lambda
+                    alpha(jdx) = sign(temp) * (a * abs(temp) - Lambda) / (a - 1);
+                else
+                    alpha(jdx) = temp;
+                end
+            end
+            
+            % 3. 更新乘子 U
+            U = U + beta - alpha;
+            
+            % 4. 收敛检查
+            err = norm(beta - alpha, 2);
+            if err < tol * max(norm(beta), 1)
+                break;
+            end
+        end
+        
+        % 在验证集上计算预测误差
+        Y_pred = X_val * beta;
+        fold_mse(fold) = mean((Y_val - Y_pred).^2);
+    end
+    
+    % 计算当前Lambda的平均MSE和标准差
+    cv_mse(lambda_idx) = mean(fold_mse);
+    cv_std(lambda_idx) = std(fold_mse);
+    
+    fprintf('Lambda = %.3f, CV MSE = %.6f ± %.6f\n', Lambda, cv_mse(lambda_idx), cv_std(lambda_idx));
+end
+
+% 找到最佳Lambda（考虑一个标准差内的最小MSE）
+[best_mse, best_lambda_idx] = min(cv_mse);
+best_lambda = lambda_values(best_lambda_idx);
+
+% 应用1标准差法则选择更简化的模型
+std_threshold = best_mse + cv_std(best_lambda_idx);
+valid_indices = find(cv_mse <= std_threshold);
+[~, best_lambda_idx_1se] = min(lambda_values(valid_indices));
+best_lambda_idx = valid_indices(best_lambda_idx_1se);
+best_lambda = lambda_values(best_lambda_idx);
+best_mse = cv_mse(best_lambda_idx);
+
+fprintf('\n=== 交叉验证结果 ===\n');
+fprintf('最佳Lambda (最小MSE): %.6f\n', best_lambda);
+fprintf('对应的CV MSE: %.6f\n', best_mse);
+fprintf('对应的标准差: %.6f\n', cv_std(best_lambda_idx));
+
+% 打印前10个最佳Lambda
+[sorted_mse, sorted_indices] = sort(cv_mse);
+fprintf('\n前10个最佳Lambda:\n');
+for k = 1:min(10, num_lambdas)
+    idx = sorted_indices(k);
+    fprintf('%2d. Lambda = %.4f, MSE = %.6f, Std = %.6f\n', k, lambda_values(idx), cv_mse(idx), cv_std(idx));
+end
+
+% 使用最佳Lambda进行最终估计
+Lambda = best_lambda;
+a = 3.7;  % SCAD平滑参数
+beta = zeros(p, 1);
+alpha = beta;
+U = zeros(p, 1);
+
+tic;
+for iter = 1:maxit
+    % 1. 更新 beta
+    A = X_j' * X_j + rho * eye(p);
+    B = X_j' * Y_j + rho * (alpha - U);
+    beta = A \ B;
+    
+    % 2. 更新 alpha (SCAD近端算子)
+    for jdx = 1:p
+        temp = beta(jdx) + U(jdx);
+        if abs(temp) <= Lambda
+            alpha(jdx) = 0;
+        elseif abs(temp) <= a * Lambda
+            alpha(jdx) = sign(temp) * (a * abs(temp) - Lambda) / (a - 1);
+        else
+            alpha(jdx) = temp;
+        end
+    end
+    
+    % 3. 更新乘子 U
+    U = U + beta - alpha;
+    
+    % 4. 收敛检查
+    err = norm(beta - alpha, 2);
+    if err < tol * max(norm(beta), 1)
+        fprintf('Converged at iteration %d (err = %.2e)\n', iter, err);
+        break;
+    end
+end
+time = toc;
+
+% ====================== 最终结果评估 ======================
+MSE = norm(beta - beta_0)^2 / p;
+
+fprintf('\n=== 最终模型评估 ===\n');
+fprintf('运行时间: %.4f 秒\n', time);
+fprintf('测试MSE: %.6f\n', MSE);
+fprintf('CV MSE: %.6f\n', best_mse);
+fprintf('迭代次数: %d\n', iter);
+fprintf('使用的Lambda: %.6f\n', Lambda);
+
+% 计算其他评估指标
+non_zero_count = sum(abs(beta) > 1e-6);  % 非零参数数量
+true_positive = sum((abs(beta) > 1e-6) & (abs(beta_0) > 1e-6));  % 正确识别的非零参数
+false_positive = sum((abs(beta) > 1e-6) & (abs(beta_0) < 1e-6));  % 错误识别的非零参数
+false_negative = sum((abs(beta) < 1e-6) & (abs(beta_0) > 1e-6));  % 错误遗漏的非零参数
+
+fprintf('非零参数数量: %d (真实: %d)\n', non_zero_count, sum(abs(beta_0) > 1e-6));
+fprintf('正确识别的非零参数: %d\n', true_positive);
+fprintf('错误识别的非零参数: %d\n', false_positive);
+fprintf('错误遗漏的非零参数: %d\n', false_negative);
+
+% 计算精度和召回率
+precision = true_positive / max(1, non_zero_count);
+recall = true_positive / max(1, sum(abs(beta_0) > 1e-6));
+f1_score = 2 * precision * recall / max(1e-10, precision + recall);
+
+fprintf('精度(Precision): %.4f\n', precision);
+fprintf('召回率(Recall): %.4f\n', recall);
+fprintf('F1分数: %.4f\n', f1_score);
+
+%% 结果可视化
+% 参数估计对比图
+pt = p;
+figure(1); 
+C = [ones(pt, 1); 2*ones(pt, 1)];        
+h2 = gscatter([1:pt, 1:pt]', [beta_0; beta], C, 'kg', 'os', [10, 10]);
+h1 = legend('True solution \beta^*', 'Estimated Solution \beta', 'Location', 'best');
+set(h1, 'FontSize', 12);
+set(h2, 'LineWidth', 2);
+axis on;
+set(gca, 'XTick', [1, 100, 200, 300, 400, 500, 560])
+set(gca, 'FontSize', 12);
+xlabel('i-th component');
+ylabel('\beta');
+title('Parameter Estimation Comparison');
+
+% 交叉验证结果图
+figure(2);
+semilogx(lambda_values, cv_mse, 'b-', 'LineWidth', 2);
+hold on;
+errorbar(lambda_values, cv_mse, cv_std, 'b.', 'MarkerSize', 8);
+plot(best_lambda, best_mse, 'ro', 'MarkerSize', 12, 'LineWidth', 3, 'MarkerFaceColor', 'r');
+xlabel('\lambda');
+ylabel('Cross-Validation MSE');
+title('Cross-Validation for SCAD Penalty Parameter Selection');
+grid on;
+legend('CV MSE', 'Standard Deviation', 'Best \lambda', 'Location', 'best');
+
+% 详细评估图
+figure(3);
+subplot(2, 2, 1);
+plot(1:p, beta_0, 'b-', 'LineWidth', 2, 'DisplayName', 'True \beta');
+hold on;
+plot(1:p, beta, 'r--', 'LineWidth', 2, 'DisplayName', 'Estimated \beta');
+title('True vs Estimated Parameters');
+xlabel('Index');
+ylabel('\beta');
+legend('Location', 'best');
+grid on;
+
+subplot(2, 2, 2);
+semilogx(lambda_values, cv_mse, 'b-', 'LineWidth', 2);
+hold on;
+errorbar(lambda_values, cv_mse, cv_std, 'b.', 'MarkerSize', 6);
+plot(best_lambda, best_mse, 'ro', 'MarkerSize', 10, 'LineWidth', 2, 'MarkerFaceColor', 'r');
+title('Cross-Validation Curve');
+xlabel('\lambda');
+ylabel('MSE');
+grid on;
+
+subplot(2, 2, 3);
+histogram(abs(beta), 50, 'FaceColor', 'blue', 'FaceAlpha', 0.6);
+title('Distribution of Estimated Parameters');
+xlabel('|Estimated \beta|');
+ylabel('Frequency');
+grid on;
+
+subplot(2, 2, 4);
+nnz_beta = sum(abs(beta) > 1e-6);
+nnz_beta0 = sum(abs(beta_0) > 1e-6);
+bar([nnz_beta0, nnz_beta]);
+set(gca, 'XTickLabel', {'True Non-Zero', 'Estimated Non-Zero'});
+title('Sparsity Comparison');
+ylabel('Number of Non-Zero Parameters');
+grid on;
+
+sgtitle(sprintf('Best \lambda = %.4f, Test MSE = %.6f, Precision = %.3f, Recall = %.3f', ...
+    best_lambda, MSE, precision, recall), 'FontSize', 14);
